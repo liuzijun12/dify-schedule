@@ -1,4 +1,4 @@
-name: Auto Multi-Site Schedule
+name: Auto Multi-Site Scheduler
 
 on:
   schedule:
@@ -7,142 +7,100 @@ on:
   workflow_dispatch:      # 支持手动触发调试
 
 env:
-  # 核心配置（从Secrets获取）
   DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}           # 分号分隔的token: token1;token2
-  DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL || 'https://api.dify.ai' }}  # 默认API地址
-  DIFY_SITES_CONFI: ${{ secrets.DIFY_SITES_CONFI }} # 多网站配置JSON
+  DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL || 'https://api.dify.ai' }}
+  DIFY_SITES_CONFI: ${{ secrets.DIFY_SITES_CONFI }} # 必须是JSON数组: [{}, {}]
 
 jobs:
   Run-Dify-Workflows:
     runs-on: ubuntu-latest
     steps:
-      # 1. 检出代码
       - name: 检出仓库代码
         uses: actions/checkout@v4
 
-      # 2. 安装Node.js和yarn（使用基础方式避免复杂配置）
       - name: 安装Node.js环境
         run: |
-          # 基础系统更新
           sudo apt update -y
-          
-          # 安装Node.js和npm
           sudo apt install -y nodejs npm
-          
-          # 安装yarn
           npm install -g yarn
-          
-          # 验证安装
           echo "Node.js版本: $(node -v)"
-          echo "npm版本: $(npm -v)"
-          echo "yarn版本: $(yarn -v)"
 
-      # 3. 安装项目依赖
-      - name: 安装项目依赖
-        run: |
-          if [ -f "package.json" ]; then
-            yarn install --frozen-lockfile
-          else
-            echo "未找到package.json，跳过依赖安装"
-          fi
-
-      # 4. 解析当前触发的任务配置
-      - name: 解析并匹配任务配置
+      - name: 解析并匹配并验证格式
         id: parse-config
         run: |
-          # 获取当前触发的cron表达式
-          CURRENT_CRON="${{ github.event.schedule }}"
+          CURRENT_CRON="${{ github.event.schedule || 'manual' }}"
           echo "当前触发的定时规则: $CURRENT_CRON"
-          
-          # 验证配置JSON格式
-          if ! echo "$DIFY_SITES_CONFI" | jq . > /dev/null 2>&1; then
-            echo "❌ DIFY_SITES_CONFI格式错误，不是有效的JSON"
+
+          # 1. 验证是否为JSON数组（核心修正）
+          if ! echo "$DIFY_SITES_CONFI" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "❌ DIFY_SITES_CONFI必须是JSON数组（用[]包裹），当前格式错误"
+            echo "错误内容预览: $(echo "$DIFY_SITES_CONFI" | cut -c 1-100)"
             exit 1
           fi
-          
-          # 查找匹配当前cron的网站配置
+
+          # 2. 验证数组不为空
+          SITE_COUNT=$(echo "$DIFY_SITES_CONFI" | jq '. | length')
+          if [ "$SITE_COUNT" -eq 0 ]; then
+            echo "❌ DIFY_SITES_CONFI数组为空，请至少配置一个网站"
+            exit 1
+          fi
+
+          # 3. 查找匹配的网站配置
           MATCHED_CONFIG=$(echo "$DIFY_SITES_CONFI" | jq -c --arg cron "$CURRENT_CRON" '.[] | select(.cron == $cron)')
           
-          # 检查是否找到匹配的配置
           if [ -z "$MATCHED_CONFIG" ] || [ "$MATCHED_CONFIG" = "null" ]; then
             echo "❌ 未找到与当前cron匹配的配置: $CURRENT_CRON"
+            echo "可用的cron配置: $(echo "$DIFY_SITES_CONFI" | jq -r '.[] | .cron')"
             exit 1
           fi
-          
-          # 提取配置信息
+
+          # 4. 提取配置参数
           SITE_NAME=$(echo "$MATCHED_CONFIG" | jq -r '.name // "未命名网站"')
           WORKFLOW_ID=$(echo "$MATCHED_CONFIG" | jq -r '.workflow_id')
           INPUTS=$(echo "$MATCHED_CONFIG" | jq -c '.inputs')
-          TOKEN_INDEX=$(echo "$DIFY_SITES_CONFI" | jq -r --arg cron "$CURRENT_CRON" 'index(.[].cron == $cron)')
-          
-          # 输出到步骤结果
+          TOKEN_INDEX=$(echo "$DIFY_SITES_CONFI" | jq -r --arg cron "$CURRENT_CRON" 'index( .[] | select(.cron == $cron) )')
+
+          # 5. 验证必要参数
+          if [ -z "$WORKFLOW_ID" ] || [ "$WORKFLOW_ID" = "null" ]; then
+            echo "❌ 工作流ID(workflow_id)不能为空"
+            exit 1
+          fi
+
           echo "::set-output name=site_name::$SITE_NAME"
           echo "::set-output name=workflow_id::$WORKFLOW_ID"
           echo "::set-output name=inputs::$INPUTS"
           echo "::set-output name=token_index::$TOKEN_INDEX"
-          
-          # 显示调试信息
-          echo "✅ 匹配到网站: $SITE_NAME"
-          echo "工作流ID: $WORKFLOW_ID"
-          echo "输入参数: $INPUTS"
+          echo "✅ 匹配到网站: $SITE_NAME（索引: $TOKEN_INDEX）"
 
-      # 5. 获取对应的Dify Token
       - name: 获取访问令牌
         id: get-token
         run: |
-          # 分割令牌列表
           IFS=';' read -ra TOKEN_ARRAY <<< "$DIFY_TOKENS"
-          
-          # 验证令牌数量匹配
-          TOKEN_COUNT=${#TOKEN_ARRAY[@]}
-          SITE_COUNT=$(echo "$DIFY_SITES_CONFI" | jq '. | length')
-          if [ $TOKEN_COUNT -ne $SITE_COUNT ]; then
-            echo "❌ 令牌数量($TOKEN_COUNT)与网站数量($SITE_COUNT)不匹配"
-            exit 1
-          fi
-          
-          # 获取当前网站对应的令牌
           TOKEN_INDEX=${{ steps.parse-config.outputs.token_index }}
           CURRENT_TOKEN=${TOKEN_ARRAY[$TOKEN_INDEX]}
           
           if [ -z "$CURRENT_TOKEN" ]; then
-            echo "❌ 未找到索引为$TOKEN_INDEX的令牌"
+            echo "❌ 未找到索引为$TOKEN_INDEX的令牌，请检查DIFY_TOKENS配置"
             exit 1
           fi
           
-          # 输出令牌（部分隐藏）
           echo "::set-output name=token::$CURRENT_TOKEN"
-          echo "使用的令牌前缀: ${CURRENT_TOKEN:0:6}****"
 
-      # 6. 执行Dify工作流
       - name: 触发Dify工作流
-        id: trigger-workflow
         run: |
-          # 准备参数
           WORKFLOW_ID=${{ steps.parse-config.outputs.workflow_id }}
           INPUTS=${{ steps.parse-config.outputs.inputs }}
           TOKEN=${{ steps.get-token.outputs.token }}
           API_URL="${DIFY_BASE_URL}/v1/workflows/trigger"
           
-          # 验证必要参数
-          if [ -z "$WORKFLOW_ID" ] || [ "$WORKFLOW_ID" = "null" ]; then
-            echo "❌ 工作流ID为空"
-            exit 1
-          fi
-          
           # 构造请求体
           PAYLOAD=$(jq -n \
             --arg wf_id "$WORKFLOW_ID" \
             --argjson inputs "$INPUTS" \
-            '{
-              "inputs": $inputs,
-              "response_mode": "blocking"
-            }')
+            '{ "inputs": $inputs, "response_mode": "blocking" }')
           
-          # 发送请求
-          echo "🔍 正在调用Dify API: $API_URL"
-          echo "请求参数: $PAYLOAD"
-          
+          # 执行API调用
+          echo "调用Dify API: $API_URL"
           RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$API_URL" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $TOKEN" \
@@ -152,21 +110,11 @@ jobs:
           HTTP_STATUS=$(echo "$RESPONSE" | tail -n1 | cut -d':' -f2)
           RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
           
-          # 检查HTTP状态
-          if [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "❌ API调用失败，HTTP状态码: $HTTP_STATUS"
-            echo "错误响应: $RESPONSE_BODY"
-            exit 1
-          fi
-          
-          # 检查业务状态
-          if ! echo "$RESPONSE_BODY" | jq -e '.success == true' > /dev/null; then
-            echo "❌ 工作流执行失败"
+          if [ "$HTTP_STATUS" -ne 200 ] || ! echo "$RESPONSE_BODY" | jq -e '.success == true' > /dev/null; then
+            echo "❌ 工作流触发失败"
+            echo "HTTP状态: $HTTP_STATUS"
             echo "响应内容: $RESPONSE_BODY"
             exit 1
           fi
           
-          # 输出成功信息
-          echo "✅ 工作流执行成功"
-          echo "响应内容: $RESPONSE_BODY"
-          echo "::set-output name=result::$RESPONSE_BODY"
+          echo "✅ 工作流触发成功: $WORKFLOW_ID"
