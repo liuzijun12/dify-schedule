@@ -7,9 +7,9 @@ on:
   workflow_dispatch:      # 手动触发调试
 
 env:
-  DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}           
+  DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}
   DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL || 'https://api.dify.ai' }}
-  DIFY_SITES_CONFI: ${{ secrets.DIFY_SITES_CONFI }} # 必须是 JSON 数组
+  DIFY_SITES_CONF: ${{ secrets.DIFY_SITES_CONF }} # ✅ 确认拼写一致
 
 jobs:
   Run-Dify-Workflows:
@@ -21,7 +21,7 @@ jobs:
       - name: 安装 Node.js 环境
         run: |
           sudo apt update -y
-          sudo apt install -y nodejs npm
+          sudo apt install -y nodejs npm jq
           npm install -g yarn
           echo "Node.js 版本: $(node -v)"
 
@@ -32,39 +32,48 @@ jobs:
           echo "当前触发的定时规则: $CURRENT_CRON"
 
           # 1. 强制验证 JSON 数组
-          if ! echo "$DIFY_SITES_CONFI" | jq -e 'type == "array"' > /dev/null 2>&1; then
-            echo "❌ DIFY_SITES_CONFI 必须是 JSON 数组（用 [] 包裹），当前格式错误"
-            echo "错误内容预览（前 100 字符）:"
-            echo "$DIFY_SITES_CONFI" | cut -c 1-100
+          if ! echo "$DIFY_SITES_CONF" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "❌ DIFY_SITES_CONF 必须是 JSON 数组（用 [] 包裹），当前格式错误"
+            echo "$DIFY_SITES_CONF" | cut -c 1-200
             exit 1
           fi
 
           # 2. 验证数组不为空
-          SITE_COUNT=$(echo "$DIFY_SITES_CONFI" | jq '. | length')
+          SITE_COUNT=$(echo "$DIFY_SITES_CONF" | jq '. | length')
           if [ "$SITE_COUNT" -eq 0 ]; then
-            echo "❌ DIFY_SITES_CONFI 数组为空，请至少配置一个网站"
+            echo "❌ DIFY_SITES_CONF 数组为空，请至少配置一个网站"
             exit 1
           fi
 
-          # 3. 查找匹配的网站配置（修复 jq 语法）
-          MATCHED_CONFIG=$(echo "$DIFY_SITES_CONFI" | jq -c --arg cron "$CURRENT_CRON" '.[] | select(.cron == $cron)')
-          
+          # 3. 查找匹配的网站配置
+          MATCHED_CONFIG=$(echo "$DIFY_SITES_CONF" | jq -c --arg cron "$CURRENT_CRON" '.[] | select(.cron == $cron)')
           if [ -z "$MATCHED_CONFIG" ] || [ "$MATCHED_CONFIG" = "null" ]; then
             echo "❌ 未找到与当前 cron 匹配的配置: $CURRENT_CRON"
             echo "可用的 cron 配置:"
-            echo "$DIFY_SITES_CONFI" | jq -r '.[] | .cron'
+            echo "$DIFY_SITES_CONF" | jq -r '.[] | .cron'
             exit 1
           fi
 
-          # 4. 提取参数（带校验）
+          # 4. 提取参数
           WORKFLOW_ID=$(echo "$MATCHED_CONFIG" | jq -r '.workflow_id')
           if [ -z "$WORKFLOW_ID" ] || [ "$WORKFLOW_ID" = "null" ]; then
             echo "❌ 工作流 ID (workflow_id) 不能为空"
             exit 1
           fi
 
-          # 输出结果
-          echo "::set-output name=workflow_id::$WORKFLOW_ID"
+          echo "workflow_id=$WORKFLOW_ID" >> $GITHUB_OUTPUT
+          echo "inputs=$(echo "$MATCHED_CONFIG" | jq -c '.inputs')" >> $GITHUB_OUTPUT
           echo "✅ 匹配到网站: $(echo "$MATCHED_CONFIG" | jq -r '.name // "未命名网站"')"
 
-      # 后续步骤（获取 Token、触发工作流）...
+      - name: 触发 Dify 工作流
+        run: |
+          WORKFLOW_ID="${{ steps.parse-config.outputs.workflow_id }}"
+          INPUTS='${{ steps.parse-config.outputs.inputs }}'
+
+          echo "🚀 开始调用工作流: $WORKFLOW_ID"
+          echo "📦 输入参数: $INPUTS"
+
+          curl -X POST "$DIFY_BASE_URL/v1/workflows/$WORKFLOW_ID/execute" \
+            -H "Authorization: Bearer $DIFY_TOKENS" \
+            -H "Content-Type: application/json" \
+            -d "{\"inputs\": $INPUTS}"
