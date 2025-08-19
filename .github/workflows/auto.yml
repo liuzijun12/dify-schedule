@@ -2,16 +2,14 @@ name: Auto
 
 on:
   schedule:
-    - cron: "30 22 * * *" # 北京时间上午06:30
+    - cron: "0 5 * * *"  # 北京时间13:00 (UTC 5:00) - 网站1
+    - cron: "10 5 * * *" # 北京时间13:10 (UTC 5:10) - 网站2
   workflow_dispatch:
 
 env:
   DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}
   DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL }}
   DIFY_INPUTS: ${{ secrets.DIFY_INPUTS }}
-  EMAIL_USER: ${{ secrets.EMAIL_USER }}
-  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-  EMAIL_TO: ${{ secrets.EMAIL_TO }}
   DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
   PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
   WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
@@ -27,7 +25,52 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: actions/setup-node@v2
-      - name: Run Project
+      
+      - name: 确定当前触发的任务
+        id: determine-task
         run: |
+          # 获取当前触发的cron表达式
+          CURRENT_CRON="${{ github.event.schedule }}"
+          echo "当前触发的cron表达式: $CURRENT_CRON"
+          
+          # 根据不同的cron表达式设置不同的环境变量
+          if [ "$CURRENT_CRON" = "0 5 * * *" ]; then
+            echo "::set-output name=SITE_INDEX::0"  # 第一个网站（13:00）
+            echo "::set-output name=SITE_NAME::网站1"
+          elif [ "$CURRENT_CRON" = "10 5 * * *" ]; then
+            echo "::set-output name=SITE_INDEX::1"  # 第二个网站（13:10）
+            echo "::set-output name=SITE_NAME::网站2"
+          fi
+
+      - name: 准备网站特定参数
+        id: prepare-params
+        run: |
+          # 从环境变量获取所有配置
+          ALL_TOKENS=(${DIFY_TOKENS//;/ })
+          ALL_INPUTS=$(echo "$DIFY_INPUTS" | jq -c '.[]')
+          
+          # 获取当前网站的配置
+          SITE_INDEX=${{ steps.determine-task.outputs.SITE_INDEX }}
+          TOKEN=${ALL_TOKENS[$SITE_INDEX]}
+          INPUT=$(echo "$ALL_INPUTS" | sed -n "$((SITE_INDEX + 1))p")
+          
+          # 输出参数供后续步骤使用
+          echo "::set-output name=TOKEN::$TOKEN"
+          echo "::set-output name=INPUT::$INPUT"
+
+      - name: 运行项目
+        env:
+          # 传递当前网站的特定参数
+          CURRENT_TOKEN: ${{ steps.prepare-params.outputs.TOKEN }}
+          CURRENT_INPUT: ${{ steps.prepare-params.outputs.INPUT }}
+          SITE_NAME: ${{ steps.determine-task.outputs.SITE_NAME }}
+        run: |
+          echo "开始处理 $SITE_NAME"
+          echo "使用的Token: ${CURRENT_TOKEN:0:6}****"  # 仅显示部分Token用于调试
+          echo "输入参数: $CURRENT_INPUT"
+          
+          # 安装依赖
           yarn
-          yarn workflowDify
+          
+          # 执行工作流，传递当前网站的参数
+          yarn workflowDify --token "$CURRENT_TOKEN" --input "$CURRENT_INPUT" --site "$SITE_NAME"
