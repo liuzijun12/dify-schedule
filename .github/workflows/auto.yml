@@ -2,14 +2,17 @@ name: Auto
 
 on:
   schedule:
-    - cron: "0 5 * * *"  # 北京时间13:00 (UTC 5:00) - 网站1
-    - cron: "10 5 * * *" # 北京时间13:10 (UTC 5:10) - 网站2
-  workflow_dispatch:
+    - cron: "0 5 * * *"   # 北京时间13:00 (UTC 5:00) - 网站1
+    - cron: "10 5 * * *"  # 北京时间13:10 (UTC 5:10) - 网站2
+  workflow_dispatch:      # 支持手动触发调试
 
 env:
-  DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}
-  DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL }}
-  DIFY_INPUTS: ${{ secrets.DIFY_INPUTS }}
+  # 基础配置（从Secrets获取）
+  DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}           # 分号分隔的token: token1;token2
+  DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL }}       # Dify API地址，默认https://api.dify.ai
+  DIFY_SITES_CONFI: ${{ secrets.DIFY_SITES_CONFI }} # 多网站配置JSON
+  
+  # 通知相关配置（按需保留）
   DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
   PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
   WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
@@ -23,54 +26,114 @@ jobs:
   DifyWorkflow:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
-      
-      - name: 确定当前触发的任务
-        id: determine-task
+      # 1. 检出代码并配置Node环境
+      - name: 检出代码
+        uses: actions/checkout@v4  # 使用最新版本action
+
+      - name: 配置Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'  # 指定Node版本，避免兼容性问题
+          cache: 'yarn'       # 缓存依赖，加速执行
+
+      # 2. 安装依赖（确保yarn可用）
+      - name: 安装依赖
+        run: |
+          npm install -g yarn  # 确保yarn全局安装
+          yarn install --frozen-lockfile  # 安装项目依赖
+
+      # 3. 确定当前触发的任务（根据cron表达式匹配网站）
+      - name: 匹配当前任务
+        id: match-task
         run: |
           # 获取当前触发的cron表达式
           CURRENT_CRON="${{ github.event.schedule }}"
-          echo "当前触发的cron表达式: $CURRENT_CRON"
+          echo "当前触发的定时规则: $CURRENT_CRON"
+
+          # 从配置中找到匹配的网站信息
+          MATCHED_SITE=$(echo "$DIFY_SITES_CONFI" | jq -r --arg cron "$CURRENT_CRON" '.[] | select(.cron == $cron)')
           
-          # 根据不同的cron表达式设置不同的环境变量
-          if [ "$CURRENT_CRON" = "0 5 * * *" ]; then
-            echo "::set-output name=SITE_INDEX::0"  # 第一个网站（13:00）
-            echo "::set-output name=SITE_NAME::网站1"
-          elif [ "$CURRENT_CRON" = "10 5 * * *" ]; then
-            echo "::set-output name=SITE_INDEX::1"  # 第二个网站（13:10）
-            echo "::set-output name=SITE_NAME::网站2"
+          # 提取关键信息
+          SITE_NAME=$(echo "$MATCHED_SITE" | jq -r '.name // "未知网站"')  # 兼容name字段
+          WORKFLOW_ID=$(echo "$MATCHED_SITE" | jq -r '.workflow_id')
+          INPUTS=$(echo "$MATCHED_SITE" | jq -c '.inputs')
+          TOKEN_INDEX=$(echo "$DIFY_SITES_CONFI" | jq -r --arg cron "$CURRENT_CRON" '.[] | select(.cron == $cron) | index')
+          
+          # 输出到步骤结果，供后续使用
+          echo "::set-output name=site_name::$SITE_NAME"
+          echo "::set-output name=workflow_id::$WORKFLOW_ID"
+          echo "::set-output name=inputs::$INPUTS"
+          echo "::set-output name=token_index::$TOKEN_INDEX"
+
+          # 调试输出
+          echo "匹配到网站: $SITE_NAME"
+          echo "工作流ID: $WORKFLOW_ID"
+          echo "输入参数: $INPUTS"
+
+      # 4. 提取当前网站对应的Token
+      - name: 获取访问Token
+        id: get-token
+        run: |
+          # 分割Token列表（分号分隔）
+          IFS=';' read -ra TOKENS <<< "$DIFY_TOKENS"
+          # 获取当前网站对应的Token
+          TOKEN=${TOKENS[${{ steps.match-task.outputs.token_index }}]}
+          echo "::set-output name=token::$TOKEN"
+          echo "使用的Token前缀: ${TOKEN:0:6}****"  # 脱敏显示
+
+      # 5. 执行Dify工作流（核心步骤）
+      - name: 执行Dify工作流
+        id: run-workflow
+        env:
+          WORKFLOW_ID: ${{ steps.match-task.outputs.workflow_id }}
+          INPUTS: ${{ steps.match-task.outputs.inputs }}
+          TOKEN: ${{ steps.get-token.outputs.token }}
+          BASE_URL: ${{ env.DIFY_BASE_URL || 'https://api.dify.ai' }}  # 默认地址
+        run: |
+          # 构造API请求体
+          PAYLOAD=$(jq -n \
+            --arg wf_id "$WORKFLOW_ID" \
+            --argjson inputs "$INPUTS" \
+            '{
+              "inputs": $inputs,
+              "response_mode": "blocking"
+            }')
+
+          # 调用Dify API
+          echo "开始调用Dify API..."
+          RESPONSE=$(curl -s -X POST "${BASE_URL}/v1/workflows/trigger" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -d "$PAYLOAD")
+
+          # 输出响应结果
+          echo "API响应: $RESPONSE"
+          echo "::set-output name=response::$RESPONSE"
+
+          # 检查执行结果
+          if echo "$RESPONSE" | jq -e '.success == true' >/dev/null; then
+            echo "✅ 工作流执行成功"
+          else
+            echo "❌ 工作流执行失败"
+            exit 1
           fi
 
-      - name: 准备网站特定参数
-        id: prepare-params
-        run: |
-          # 从环境变量获取所有配置
-          ALL_TOKENS=(${DIFY_TOKENS//;/ })
-          ALL_INPUTS=$(echo "$DIFY_INPUTS" | jq -c '.[]')
-          
-          # 获取当前网站的配置
-          SITE_INDEX=${{ steps.determine-task.outputs.SITE_INDEX }}
-          TOKEN=${ALL_TOKENS[$SITE_INDEX]}
-          INPUT=$(echo "$ALL_INPUTS" | sed -n "$((SITE_INDEX + 1))p")
-          
-          # 输出参数供后续步骤使用
-          echo "::set-output name=TOKEN::$TOKEN"
-          echo "::set-output name=INPUT::$INPUT"
-
-      - name: 运行项目
+      # 6. 发送通知（可选，根据需要保留）
+      - name: 发送执行结果通知
+        if: always()  # 无论成功失败都发送
         env:
-          # 传递当前网站的特定参数
-          CURRENT_TOKEN: ${{ steps.prepare-params.outputs.TOKEN }}
-          CURRENT_INPUT: ${{ steps.prepare-params.outputs.INPUT }}
-          SITE_NAME: ${{ steps.determine-task.outputs.SITE_NAME }}
+          SITE_NAME: ${{ steps.match-task.outputs.site_name }}
+          RESPONSE: ${{ steps.run-workflow.outputs.response }}
+          # 通知渠道配置（按需启用）
+          DINGDING_WEBHOOK: ${{ env.DINGDING_WEBHOOK }}
         run: |
-          echo "开始处理 $SITE_NAME"
-          echo "使用的Token: ${CURRENT_TOKEN:0:6}****"  # 仅显示部分Token用于调试
-          echo "输入参数: $CURRENT_INPUT"
-          
-          # 安装依赖
-          yarn
-          
-          # 执行工作流，传递当前网站的参数
-          yarn workflowDify --token "$CURRENT_TOKEN" --input "$CURRENT_INPUT" --site "$SITE_NAME"
+          # 构建通知内容
+          STATUS=$(echo "$RESPONSE" | jq -r '.success == true ? "成功" : "失败"')
+          MESSAGE="网站【$SITE_NAME】定时任务执行$STATUS\n响应: $(echo "$RESPONSE" | jq -r '.message // "无消息"')"
+
+          # 发送钉钉通知（示例）
+          if [ -n "$DINGDING_WEBHOOK" ]; then
+            curl -s -X POST "$DINGDING_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d '{"msgtype":"text","text":{"content":"'"$MESSAGE"'"}}'
+          fi
