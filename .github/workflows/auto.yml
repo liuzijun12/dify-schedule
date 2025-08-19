@@ -9,7 +9,7 @@ on:
 env:
   DIFY_TOKENS: ${{ secrets.DIFY_TOKENS }}
   DIFY_BASE_URL: ${{ secrets.DIFY_BASE_URL }}
-  DIFY_SITES_CONF: ${{ secrets.DIFY_SITES_CONFI }}  # 👉 确保仓库 Secrets 名称一致
+  DIFY_SITES_CONF: ${{ secrets.DIFY_SITES_CONF }}  # 👉 确保仓库 Secrets 名称一致
 
 jobs:
   Run-Dify-Workflows:
